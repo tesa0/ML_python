@@ -1,0 +1,237 @@
+import pandas as pd
+
+import datetime
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+file_path = '/content/drive/MyDrive/teX3.csv'
+df = pd.read_csv(file_path, sep=',',header=None, on_bad_lines='skip')
+df.columns = ["Timeindex", "2", "MidPrice"]
+df.set_index('Timeindex')
+# print (df)
+
+file_path = '/content/drive/MyDrive/teX1.csv'
+df1 = pd.read_csv(file_path, sep=',',header=None, on_bad_lines='skip')
+df1.columns = ["Timeindex", "2", "LFcoinsVol"]
+df1.set_index('Timeindex')
+# print (df1)
+
+file_path = '/content/drive/MyDrive/teX2.csv'
+df2 = pd.read_csv(file_path, sep=',',header=None, on_bad_lines='skip')
+df2.columns = ["Timeindex", "2", "LFSignalVol"] #IF(WMAX(1200000, LFcoinsVol)>0.7,WMAX(1200000, LFcoinsVol),NA)
+df2.set_index('Timeindex')
+# print (df2)
+
+# print(type(df), df.shape)
+nan_value = float("NaN")
+df.replace("0", nan_value, inplace=True)
+df.dropna(subset=['MidPrice'], inplace=True) 
+df.drop('2', inplace=True, axis=1)
+# print(type(df), df.shape)
+
+# print(type(df1), df1.shape)
+nan_value = float("NaN")
+df1.dropna(subset=['LFcoinsVol'], inplace=True) 
+df1.drop('2', inplace=True, axis=1)
+# print(type(df1), df1.shape)
+
+# print(type(df2), df2.shape)
+nan_value = float("NaN")
+df2.dropna(subset=['LFSignalVol'], inplace=True) 
+df2.drop('2', inplace=True, axis=1)
+# print(type(df2), df2.shape)
+
+df['Timeindex']=df['Timeindex'].apply(lambda x: datetime.datetime.strptime(x, "%Y:%m:%d:%H:%M:%S.%f").timestamp())
+df1['Timeindex']=df1['Timeindex'].apply(lambda x: datetime.datetime.strptime(x, "%Y:%m:%d:%H:%M:%S.%f").timestamp())
+df2['Timeindex']=df2['Timeindex'].apply(lambda x: datetime.datetime.strptime(x, "%Y:%m:%d:%H:%M:%S.%f").timestamp())
+
+left = pd.merge_asof(df, df1, on="Timeindex")
+# left #2934237 rows
+all = pd.merge_asof(left, df2, on="Timeindex")
+# all #2934237 rows BTCUSDT secondly data from Binance (Jan-Mar22)
+
+shiftedmid = all['MidPrice'].shift(600) # change of price in last 600 sec
+all['MidWDelta'] = all['MidPrice'] - shiftedmid
+all.dropna(subset=['MidWDelta'], inplace=True) 
+all['LFSignalVol'].replace(nan_value, 0, inplace=True) # delete?
+
+MidPriceMin = 10  # change of price in last 600 sec not less than MidPriceMin
+delta = 660 # the next open price should differ for 660 $ from the current open price (pass for now)   
+teXBPS = 1/10000 
+all['cprice'] = all.MidPrice * all.LFSignalVol 
+all['teXtp0'] = 0.0022*all.cprice
+all['teXtp1'] = 0.0014*all.cprice 
+all['teXtpt'] = 0.0002*all.cprice 
+all['teXSsl'] = 0.0017*all.cprice 
+all[['buy','sell','avgprice','teXwallet','tradesize','pnl','teXstp0','teXstp1','teXstpt','teXstsl']] = 0.0
+all.Timeindex = all.Timeindex.astype(int) 
+teXmaxpos = 3 # 3 BTC in our wallet
+all.teXwallet = teXmaxpos - all.tradesize # free funds in our wallet
+all = all.reset_index()
+all = all.drop('index', axis=1)
+all.tail()
+
+allmini = all.copy()
+
+mask_sell_cond1 = (allmini['LFcoinsVol'] > allmini['LFSignalVol']) & (allmini['MidWDelta'] > MidPriceMin) & (allmini['tradesize'] >= -0.00005) & (allmini['LFSignalVol'] > 0.7)
+mask_sell_cond2 = (allmini['LFcoinsVol'] > allmini['LFSignalVol']) & (allmini['MidPrice'] > allmini['avgprice']+delta) & (allmini['tradesize'] < -0.00005) & (allmini['LFSignalVol'] > 0.7)
+allmini.loc[mask_sell_cond1,'sell'] = 1 
+allmini.loc[mask_sell_cond2,'sell'] = 1
+
+mask_buy_cond1 = (allmini['tradesize'] > 0.00005) & (allmini['MidPrice']>allmini['teXstpt']) & (allmini['teXstpt']!=0)
+mask_buy_cond2 = (allmini['tradesize'] > 0.00005) & (allmini['MidPrice']<allmini['teXstp0']) & (allmini['teXstp0']!=0)
+mask_buy_cond3 = (allmini['tradesize'] > 0.00005) & (allmini['MidPrice']>allmini['teXstsl']) & (allmini['teXstsl']!=0)
+allmini.loc[mask_buy_cond1,'buy'] = 1
+allmini.loc[mask_buy_cond2,'buy'] = 1
+allmini.loc[mask_buy_cond3,'buy'] = 1
+
+open=[] # open prices
+close=[] # close prices
+vol=[] # trading volume
+deals=0 # amount of deals
+pos=0 # 0 - by default, 1 - we have opened position
+sec=0 # counter of time (in sec) in opened position (we close a deal after 21.5h by default as a precaution)
+for i in allmini[9656:77403].index: #for full picture take allmini[9656:77403]
+  
+  def chec_stats():
+
+    print('position: ',pos,
+          'seconds of opened position: ',sec,
+          'df index: ',i,
+          'buy: ',allmini.loc[i,'buy'],
+          'sell: ',allmini.loc[i,'sell'])
+    
+  # check_stats() # here or ..?
+
+  # (1) pos 0, sell 0 --> do nothing, keep looking for sell = 1 to open a deal
+  if (pos == 0 and allmini.loc[i,'sell'] == 0 and i>0):
+    
+    allmini.loc[i,'pnl'] = allmini.loc[i-1,'pnl']
+    # check stats()
+    continue
+
+  # (2) pos 0, sell 1 --> open position here
+  if (pos == 0 and allmini.loc[i,'sell'] == 1):
+
+    pos=1
+    sec+=1
+    open.append(allmini.loc[i,'MidPrice'])
+    vol.append(allmini.loc[i,'LFcoinsVol'])
+
+    allmini.loc[i,'tradesize'] = allmini.loc[i,'LFcoinsVol']
+    allmini.loc[i,'teXwallet'] -= allmini.loc[i,'tradesize']
+    allmini.loc[i,'avgprice'] = allmini.loc[i,'MidPrice'] 
+    allmini.loc[i,'teXstp0'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp0'])
+    if allmini.loc[i-1,'teXstp0']!=0:
+      allmini.loc[i,'teXstp0']=max(allmini.loc[i-1,'teXstp0'],allmini.loc[i,'teXstp0'])
+    allmini.loc[i,'teXstp1'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp1'])
+    if allmini.loc[i-1,'teXstp1']!=0:
+      allmini.loc[i,'teXstp1']=min(allmini.loc[i,'teXstp1'],allmini.loc[i-1,'teXstp1'])
+    allmini.loc[i,'teXstpt'] = allmini.loc[i,'avgprice']*(1+1/10000*allmini.loc[i,'teXtpt'])
+    if allmini.loc[i,'teXstp1']>allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']= min(allmini.loc[i,'teXstpt'], allmini.loc[i,'teXstp1'])
+    elif allmini.loc[i,'teXstp1']<allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']=allmini.loc[i,'teXstp1']
+    if allmini.loc[i,'avgprice'] > allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl']):
+      allmini.loc[i,'teXstsl'] = allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl'])
+    elif allmini.loc[i-1,'teXstsl'] != 0:
+      allmini.loc[i,'teXstsl'] = min(allmini.loc[i,'teXstsl'],allmini.loc[i-1,'teXstsl'])
+    
+    allmini.loc[i,'pnl'] += allmini.loc[i,'tradesize']*(allmini.loc[i,'avgprice']-allmini.loc[i,'MidPrice'])
+
+    # if allmini.loc[i,'teXwallet']>0.0001:
+    #   print('free money in wallet: ', allmini.loc[i,'teXwallet'])
+    # check stats()
+    continue
+  
+  # (3) pos 1, buy 0 --> position's still opened 
+  if (pos == 1 and allmini.loc[i,'buy'] == 0):
+
+    sec+=1
+
+    allmini.loc[i,'tradesize'] = allmini.loc[i-1,'tradesize']
+    allmini.loc[i,'avgprice'] = allmini.loc[i-1,'avgprice'] 
+    allmini.loc[i,'pnl'] += allmini.loc[i,'tradesize']*(allmini.loc[i,'avgprice']-allmini.loc[i,'MidPrice'])
+
+    allmini.loc[i,'teXwallet'] -= allmini.loc[i,'tradesize']
+    allmini.loc[i,'teXstp0'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp0'])
+    if allmini.loc[i-1,'teXstp0']!=0:
+      allmini.loc[i,'teXstp0']=max(allmini.loc[i-1,'teXstp0'],allmini.loc[i,'teXstp0'])
+    allmini.loc[i,'teXstp1'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp1'])
+    if allmini.loc[i-1,'teXstp1']!=0:
+      allmini.loc[i,'teXstp1']=min(allmini.loc[i,'teXstp1'],allmini.loc[i-1,'teXstp1'])
+    allmini.loc[i,'teXstpt'] = allmini.loc[i,'avgprice']*(1+1/10000*allmini.loc[i,'teXtpt'])
+    if allmini.loc[i,'teXstp1']>allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']= min(allmini.loc[i,'teXstpt'], allmini.loc[i,'teXstp1'])
+    elif allmini.loc[i,'teXstp1']<allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']=allmini.loc[i,'teXstp1']
+    if allmini.loc[i,'avgprice'] > allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl']):
+      allmini.loc[i,'teXstsl'] = allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl'])
+    elif allmini.loc[i-1,'teXstsl'] != 0:
+      allmini.loc[i,'teXstsl'] = min(allmini.loc[i,'teXstsl'],allmini.loc[i-1,'teXstsl'])
+    
+    # check stats()
+
+  # (4.1) pos 1, buy 1 --> close position
+  if (pos == 1 and allmini.loc[i,'buy'] == 1):
+
+    pos = 0
+    sec = 0
+
+    allmini.loc[i,'pnl'] += allmini.loc[i,'tradesize']*(allmini.loc[i,'avgprice']-allmini.loc[i,'MidPrice'])
+
+    allmini.loc[i,'teXwallet'] -= allmini.loc[i,'tradesize']
+    allmini.loc[i,'teXstp0'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp0'])
+    if allmini.loc[i-1,'teXstp0']!=0:
+      allmini.loc[i,'teXstp0']=max(allmini.loc[i-1,'teXstp0'],allmini.loc[i,'teXstp0'])
+    allmini.loc[i,'teXstp1'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp1'])
+    if allmini.loc[i-1,'teXstp1']!=0:
+      allmini.loc[i,'teXstp1']=min(allmini.loc[i,'teXstp1'],allmini.loc[i-1,'teXstp1'])
+    allmini.loc[i,'teXstpt'] = allmini.loc[i,'avgprice']*(1+1/10000*allmini.loc[i,'teXtpt'])
+    if allmini.loc[i,'teXstp1']>allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']= min(allmini.loc[i,'teXstpt'], allmini.loc[i,'teXstp1'])
+    elif allmini.loc[i,'teXstp1']<allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']=allmini.loc[i,'teXstp1']
+    if allmini.loc[i,'avgprice'] > allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl']):
+      allmini.loc[i,'teXstsl'] = allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl'])
+    elif allmini.loc[i-1,'teXstsl'] != 0:
+      allmini.loc[i,'teXstsl'] = min(allmini.loc[i,'teXstsl'],allmini.loc[i-1,'teXstsl'])
+
+    # check stats()
+
+  # (4.2) sec>77400, abs(allmini.loc[i,'avgprice']-allmini.loc[i,'MidPrice'])<25 --> close position
+  if (sec>77400, abs(allmini.loc[i,'avgprice']-allmini.loc[i,'MidPrice'])<25):
+
+    pos = 0
+    sec = 0
+    allmini.loc[i,'buy'] = 1
+
+    allmini.loc[i,'pnl'] += allmini.loc[i,'tradesize']*(allmini.loc[i,'avgprice']-allmini.loc[i,'MidPrice'])
+
+    allmini.loc[i,'teXwallet'] -= allmini.loc[i,'tradesize']
+    allmini.loc[i,'teXstp0'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp0'])
+    if allmini.loc[i-1,'teXstp0']!=0:
+      allmini.loc[i,'teXstp0']=max(allmini.loc[i-1,'teXstp0'],allmini.loc[i,'teXstp0'])
+    allmini.loc[i,'teXstp1'] = allmini.loc[i,'avgprice']*(1-1/10000*allmini.loc[i,'teXtp1'])
+    if allmini.loc[i-1,'teXstp1']!=0:
+      allmini.loc[i,'teXstp1']=min(allmini.loc[i,'teXstp1'],allmini.loc[i-1,'teXstp1'])
+    allmini.loc[i,'teXstpt'] = allmini.loc[i,'avgprice']*(1+1/10000*allmini.loc[i,'teXtpt'])
+    if allmini.loc[i,'teXstp1']>allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']= min(allmini.loc[i,'teXstpt'], allmini.loc[i,'teXstp1'])
+    elif allmini.loc[i,'teXstp1']<allmini.loc[i,'teXstpt']:
+      allmini.loc[i,'teXstpt']=allmini.loc[i,'teXstp1']
+    if allmini.loc[i,'avgprice'] > allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl']):
+      allmini.loc[i,'teXstsl'] = allmini.loc[i,'MidPrice']*(1+1/10000*allmini.loc[i,'teXSsl'])
+    elif allmini.loc[i-1,'teXstsl'] != 0:
+      allmini.loc[i,'teXstsl'] = min(allmini.loc[i,'teXstsl'],allmini.loc[i-1,'teXstsl'])
+
+    # check stats()
+
+  else:
+    print('something unexpected')
+
+# print results
+print(f'The resulting pnl is: {allmini.loc[i,"pnl"]}')
+if pos != 0:
+  print(f'We have opened position for {sec} seconds')
